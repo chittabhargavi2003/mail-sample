@@ -10,6 +10,13 @@ For each .msg file the script produces a PDF that contains:
                           on a dedicated page; other file types listed on a
                           placeholder page)
 
+Attachment resolution order
+---------------------------
+  a) Attachments embedded directly inside the .msg file (most common).
+  b) Companion files found next to the .msg file whose names match attachment
+     references in the email body (e.g. the .msg was saved alongside its PDF).
+  c) Files found in the directory supplied with --attachments-dir / -a.
+
 Usage
 -----
     # Convert a single file
@@ -24,9 +31,12 @@ Usage
     # Specify a custom output directory
     python msg_to_pdf.py /path/to/folder --output /path/to/output
 
+    # Specify where to look for companion attachment files
+    python msg_to_pdf.py /path/to/folder --attachments-dir /path/to/attachments
+
 Dependencies (install via pip)
 -------------------------------
-    pip install extract-msg reportlab pillow pypdf html2text
+    pip install extract-msg reportlab pillow pypdf html2text beautifulsoup4
 """
 
 from __future__ import annotations
@@ -126,6 +136,23 @@ STYLE_PLACEHOLDER = ParagraphStyle(
     textColor=colors.grey,
 )
 
+# ---------------------------------------------------------------------------
+# Module-level constants shared across helpers
+# ---------------------------------------------------------------------------
+
+# Regex pattern for filenames with common attachment extensions referenced in
+# email body text.  Uses negative look-around so it does not match filenames
+# that are part of a longer word or a domain segment.
+_FILENAME_PATTERN = re.compile(
+    r"(?<!\w)([\w\-. ]+\.(?:pdf|docx?|xlsx?|png|jpe?g|gif|txt|csv))(?!\w)",
+    re.IGNORECASE,
+)
+
+# Image file extensions that can be embedded as a page in the output PDF.
+_IMAGE_EXTENSIONS = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -198,24 +225,50 @@ def _recipient_display_names(msg: extract_msg.Message) -> List[str]:
 
 
 def _attachment_names(msg: extract_msg.Message) -> List[str]:
-    """Return display names for all file attachments."""
+    """Return display names for all file attachments (embedded + body-referenced)."""
     names: List[str] = []
     for att in msg.attachments:
         name = att.longFilename or att.shortFilename or "attachment"
         names.append(name)
-    # Also look for attachment references in the plain-text body
-    # (some .msg files embed attachment links rather than actual data).
-    # The pattern matches bare filenames (no leading word chars) with common
-    # attachment extensions, anchored at a word boundary so it does not match
-    # mid-word strings or domain names.
-    if not names and msg.body:
-        pattern = r"(?<!\w)([\w\-. ]+\.(?:pdf|docx?|xlsx?|png|jpe?g|gif|txt|csv))(?!\w)"
-        found = re.findall(pattern, msg.body, re.IGNORECASE)
-        for f in found:
+    # Also surface attachment references in the plain-text body that are not
+    # already covered by an embedded attachment entry.
+    if msg.body:
+        for f in _FILENAME_PATTERN.findall(msg.body):
             fname = os.path.basename(f.replace("\\", "/"))
             if fname and fname not in names:
                 names.append(fname)
     return names
+
+
+def _extract_referenced_filenames(msg: extract_msg.Message) -> List[str]:
+    """
+    Return the list of filenames referenced in the message body but NOT
+    embedded as proper attachments.  These are candidates for companion-file
+    lookup on disk.
+    """
+    embedded = {
+        att.longFilename or att.shortFilename or ""
+        for att in msg.attachments
+    }
+    referenced: List[str] = []
+    if msg.body:
+        for f in _FILENAME_PATTERN.findall(msg.body):
+            fname = os.path.basename(f.replace("\\", "/"))
+            if fname and fname not in embedded and fname not in referenced:
+                referenced.append(fname)
+    return referenced
+
+
+def _find_companion_file(filename: str, search_dirs: List[Path]) -> Optional[Path]:
+    """
+    Search *search_dirs* (in order) for a file matching *filename*.
+    Returns the first match found, or None.
+    """
+    for d in search_dirs:
+        candidate = d / filename
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -332,25 +385,15 @@ def _attachment_to_pdf_bytes(att) -> Optional[bytes]:
     return None
 
 
-def _build_image_page(att) -> Optional[bytes]:
+def _build_image_page_from_bytes(image_data: bytes, display_name: str) -> Optional[bytes]:
     """
-    Render an image attachment as a single-page PDF (A4) and return the bytes.
-    Returns None if the attachment is not a supported image.
+    Render image bytes as a single-page PDF (A4) and return the bytes.
+    Returns None on failure.
     """
-    name = (att.longFilename or att.shortFilename or "").lower()
-    image_exts = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp")
-    if not any(name.endswith(ext) for ext in image_exts):
-        return None
-
-    data = att.data
-    if not data:
-        return None
-
     try:
-        img = Image.open(io.BytesIO(data))
+        img = Image.open(io.BytesIO(image_data))
         img_w, img_h = img.size
 
-        # Fit the image inside the page with margins
         max_w = PAGE_WIDTH - 2 * MARGIN
         max_h = PAGE_HEIGHT - 2 * MARGIN
         scale = min(max_w / img_w, max_h / img_h, 1.0)
@@ -366,17 +409,33 @@ def _build_image_page(att) -> Optional[bytes]:
             topMargin=MARGIN,
             bottomMargin=MARGIN,
         )
-        display_name = att.longFilename or att.shortFilename or "image"
         story = [
             Paragraph(_escape_xml(display_name), STYLE_ATTACHMENT_TITLE),
             Spacer(1, 0.3 * cm),
-            RLImage(io.BytesIO(data), width=draw_w, height=draw_h),
+            RLImage(io.BytesIO(image_data), width=draw_w, height=draw_h),
         ]
         doc.build(story)
         return buf.getvalue()
     except Exception as exc:
-        log.warning("Could not render image attachment '%s': %s", name, exc)
+        log.warning("Could not render image '%s': %s", display_name, exc)
         return None
+
+
+def _build_image_page(att) -> Optional[bytes]:
+    """
+    Render an image attachment as a single-page PDF (A4) and return the bytes.
+    Returns None if the attachment is not a supported image.
+    """
+    name = (att.longFilename or att.shortFilename or "").lower()
+    if Path(name).suffix not in _IMAGE_EXTENSIONS:
+        return None
+
+    data = att.data
+    if not data:
+        return None
+
+    display_name = att.longFilename or att.shortFilename or "image"
+    return _build_image_page_from_bytes(data, display_name)
 
 
 def _build_placeholder_page(att) -> bytes:
@@ -415,16 +474,23 @@ def _build_placeholder_page(att) -> bytes:
 # Core conversion function
 # ---------------------------------------------------------------------------
 
-def msg_to_pdf(msg_path: str | Path, output_path: Optional[str | Path] = None) -> Path:
+def msg_to_pdf(
+    msg_path: str | Path,
+    output_path: Optional[str | Path] = None,
+    attachments_dir: Optional[str | Path] = None,
+) -> Path:
     """
     Convert a single .msg file to a PDF file.
 
     Parameters
     ----------
-    msg_path    : path to the source .msg file
-    output_path : destination PDF path (optional).  When omitted, the PDF is
-                  placed in the same directory as the .msg file with the same
-                  stem (e.g. email.msg → email.pdf).
+    msg_path        : path to the source .msg file
+    output_path     : destination PDF path (optional).  When omitted, the PDF is
+                      placed in the same directory as the .msg file with the same
+                      stem (e.g. email.msg → email.pdf).
+    attachments_dir : optional extra directory to search for companion attachment
+                      files that are referenced in the email body but not embedded
+                      in the .msg file itself.
 
     Returns
     -------
@@ -441,6 +507,14 @@ def msg_to_pdf(msg_path: str | Path, output_path: Optional[str | Path] = None) -
 
     msg = extract_msg.Message(str(msg_path))
 
+    # Directories to search when resolving companion attachment files.
+    # Priority: msg directory first, then user-supplied attachments_dir.
+    search_dirs: List[Path] = [msg_path.parent]
+    if attachments_dir is not None:
+        extra = Path(attachments_dir).resolve()
+        if extra not in search_dirs:
+            search_dirs.append(extra)
+
     # 1. Build the header + body PDF
     header_body_bytes = _build_header_body_pdf(msg)
 
@@ -452,7 +526,7 @@ def msg_to_pdf(msg_path: str | Path, output_path: Optional[str | Path] = None) -
     for page in reader.pages:
         writer.add_page(page)
 
-    # Process each attachment
+    # 2a. Process each *embedded* attachment
     for att in msg.attachments:
         att_name = att.longFilename or att.shortFilename or "attachment"
 
@@ -484,6 +558,35 @@ def msg_to_pdf(msg_path: str | Path, output_path: Optional[str | Path] = None) -
         for page in ph_reader.pages:
             writer.add_page(page)
 
+    # 2b. Resolve *companion* files referenced in the body but not embedded.
+    #     Search alongside the .msg file and in any user-supplied directory.
+    referenced = _extract_referenced_filenames(msg)
+    for ref_name in referenced:
+        companion = _find_companion_file(ref_name, search_dirs)
+        if companion is None:
+            log.debug("  Companion file not found on disk: %s", ref_name)
+            continue
+
+        ext = companion.suffix.lower()
+        log.info("  Merging companion file: %s", companion.name)
+
+        if ext == ".pdf":
+            try:
+                att_reader = PdfReader(str(companion))
+                for page in att_reader.pages:
+                    writer.add_page(page)
+            except Exception as exc:
+                log.warning("  Could not merge companion PDF '%s': %s", companion.name, exc)
+
+        elif ext in _IMAGE_EXTENSIONS:
+            img_bytes = _build_image_page_from_bytes(companion.read_bytes(), companion.name)
+            if img_bytes:
+                img_reader = PdfReader(io.BytesIO(img_bytes))
+                for page in img_reader.pages:
+                    writer.add_page(page)
+        else:
+            log.info("  Companion file '%s' cannot be rendered inline (unsupported type)", companion.name)
+
     # 3. Write the final PDF
     with open(output_path, "wb") as f:
         writer.write(f)
@@ -499,14 +602,17 @@ def msg_to_pdf(msg_path: str | Path, output_path: Optional[str | Path] = None) -
 def convert_directory(
     input_dir: str | Path,
     output_dir: Optional[str | Path] = None,
+    attachments_dir: Optional[str | Path] = None,
 ) -> List[Path]:
     """
     Convert all .msg files found in *input_dir* (non-recursive).
 
     Parameters
     ----------
-    input_dir  : directory containing .msg files
-    output_dir : directory for output PDFs (defaults to *input_dir*)
+    input_dir       : directory containing .msg files
+    output_dir      : directory for output PDFs (defaults to *input_dir*)
+    attachments_dir : optional extra directory to search for companion
+                      attachment files (see :func:`msg_to_pdf`)
 
     Returns
     -------
@@ -524,7 +630,7 @@ def convert_directory(
             pdf_path = Path(output_dir) / (msg_file.stem + ".pdf")
         else:
             pdf_path = None
-        results.append(msg_to_pdf(msg_file, pdf_path))
+        results.append(msg_to_pdf(msg_file, pdf_path, attachments_dir=attachments_dir))
     return results
 
 
@@ -550,21 +656,32 @@ def _parse_args(argv=None):
         metavar="DIR",
         help="Output directory for generated PDF files (default: same as each input file)",
     )
+    parser.add_argument(
+        "--attachments-dir",
+        "-a",
+        metavar="DIR",
+        help=(
+            "Directory to search for companion attachment files that are referenced "
+            "in the email body but not embedded in the .msg file itself. "
+            "The .msg file's own directory is always searched first."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = _parse_args(argv)
     output_dir = Path(args.output) if args.output else None
+    attachments_dir = Path(args.attachments_dir) if args.attachments_dir else None
 
     generated: List[Path] = []
     for inp in args.inputs:
         p = Path(inp)
         if p.is_dir():
-            generated.extend(convert_directory(p, output_dir))
+            generated.extend(convert_directory(p, output_dir, attachments_dir=attachments_dir))
         elif p.is_file() and p.suffix.lower() == ".msg":
             pdf_dest = (output_dir / (p.stem + ".pdf")) if output_dir else None
-            generated.append(msg_to_pdf(p, pdf_dest))
+            generated.append(msg_to_pdf(p, pdf_dest, attachments_dir=attachments_dir))
         else:
             log.error("Skipping '%s': not a .msg file or directory", inp)
 
