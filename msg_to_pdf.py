@@ -259,16 +259,95 @@ def _extract_referenced_filenames(msg: extract_msg.Message) -> List[str]:
     return referenced
 
 
-def _find_companion_file(filename: str, search_dirs: List[Path]) -> Optional[Path]:
+def _extract_href_paths_from_html(msg: extract_msg.Message) -> dict:
     """
-    Search *search_dirs* (in order) for a file matching *filename*.
-    Returns the first match found, or None.
+    Parse the HTML body for hyperlinks whose link text or href looks like a
+    file attachment.  Returns a dict:  filename -> list of absolute path strings
+    found in href attributes.  These paths can be tried directly on disk (useful
+    when the script runs on the same machine that generated the email).
+    """
+    result: dict = {}
+    html = msg.htmlBody
+    if not html:
+        return result
+    if isinstance(html, bytes):
+        html = html.decode("utf-8", errors="replace")
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # Normalise Windows back-slashes
+        href_fwd = href.replace("\\", "/")
+        filename = os.path.basename(href_fwd)
+        if filename and _FILENAME_PATTERN.search(filename):
+            if filename not in result:
+                result[filename] = []
+            if href not in result[filename]:
+                result[filename].append(href)
+    return result
+
+
+def _find_companion_file(
+    filename: str,
+    search_dirs: List[Path],
+    extra_paths: Optional[List[str]] = None,
+) -> Optional[Path]:
+    """
+    Try to locate *filename* on disk.
+
+    Resolution order:
+      1. Each directory in *search_dirs* (msg directory first, then
+         user-supplied --attachments-dir).
+      2. The literal absolute paths in *extra_paths* (harvested from HTML
+         href attributes), so scripts running on the same machine that sent
+         the email can find the file automatically.
+
+    Returns the first existing Path found, or None.
     """
     for d in search_dirs:
         candidate = d / filename
         if candidate.is_file():
             return candidate
+    for abs_path in (extra_paths or []):
+        p = Path(abs_path)
+        if p.is_file():
+            return p
     return None
+
+
+def _build_missing_attachment_page(filename: str, original_path: Optional[str] = None) -> bytes:
+    """
+    Build a placeholder page for a referenced attachment that could not be
+    found on disk.  Shows the filename and, when available, the original path
+    so the user knows exactly which file to provide.
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=MARGIN,
+        rightMargin=MARGIN,
+        topMargin=MARGIN,
+        bottomMargin=MARGIN,
+    )
+    story = [
+        Paragraph("Attachment – File Not Found", STYLE_ATTACHMENT_TITLE),
+        HRFlowable(width="100%", thickness=0.5, color=colors.lightgrey, spaceAfter=8),
+        Paragraph(_escape_xml(f"File name: {filename}"), STYLE_BODY),
+    ]
+    if original_path:
+        story.append(Paragraph(_escape_xml(f"Original path: {original_path}"), STYLE_BODY))
+    story += [
+        Spacer(1, 0.5 * cm),
+        Paragraph(
+            "This attachment was referenced in the email but could not be located "
+            "on disk.  To include its content, place the file alongside the .msg "
+            "file or use the --attachments-dir option to point to the folder "
+            "containing the attachment.",
+            STYLE_PLACEHOLDER,
+        ),
+    ]
+    doc.build(story)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +537,8 @@ def _build_placeholder_page(att) -> bytes:
     story = [
         Paragraph("Attachment", STYLE_ATTACHMENT_TITLE),
         HRFlowable(width="100%", thickness=0.5, color=colors.lightgrey, spaceAfter=8),
-        Paragraph(_escape_xml(f"File name : {name}"), STYLE_BODY),
-        Paragraph(_escape_xml(f"File size : {size:,} bytes"), STYLE_BODY),
+        Paragraph(_escape_xml(f"File name: {name}"), STYLE_BODY),
+        Paragraph(_escape_xml(f"File size: {size:,} bytes"), STYLE_BODY),
         Spacer(1, 0.5 * cm),
         Paragraph(
             "This attachment type cannot be rendered inline.",
@@ -559,12 +638,27 @@ def msg_to_pdf(
             writer.add_page(page)
 
     # 2b. Resolve *companion* files referenced in the body but not embedded.
-    #     Search alongside the .msg file and in any user-supplied directory.
+    #     Resolution order:
+    #       1. Directories on disk (msg dir + optional --attachments-dir).
+    #       2. Absolute paths harvested from HTML href attributes (works when
+    #          the script runs on the same machine that generated the email).
     referenced = _extract_referenced_filenames(msg)
+    href_paths = _extract_href_paths_from_html(msg)   # {filename: [abs_path, ...]}
     for ref_name in referenced:
-        companion = _find_companion_file(ref_name, search_dirs)
+        extra = href_paths.get(ref_name, [])
+        companion = _find_companion_file(ref_name, search_dirs, extra_paths=extra)
         if companion is None:
-            log.debug("  Companion file not found on disk: %s", ref_name)
+            log.warning(
+                "  Attachment '%s' referenced but not found on disk – "
+                "adding placeholder page (provide the file via --attachments-dir "
+                "or place it next to the .msg file)",
+                ref_name,
+            )
+            original_path = extra[0] if extra else None
+            miss_bytes = _build_missing_attachment_page(ref_name, original_path)
+            miss_reader = PdfReader(io.BytesIO(miss_bytes))
+            for page in miss_reader.pages:
+                writer.add_page(page)
             continue
 
         ext = companion.suffix.lower()
